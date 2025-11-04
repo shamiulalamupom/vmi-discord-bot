@@ -1,0 +1,7 @@
+# Environment files
+.env
+.env.*
+*.env
+
+# Virtual environment directories
+env/
