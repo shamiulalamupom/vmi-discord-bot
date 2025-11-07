@@ -5,3 +5,4 @@
 
 # Virtual environment directories
 env/
+__pycache__/
