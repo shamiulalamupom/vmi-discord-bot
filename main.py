@@ -3,7 +3,7 @@ from discord.ext import commands
 from config import DISCORD_TOKEN, GUILD_ID, LOG_LEVEL, LOG_FILE
 from logging_setup import setup_logging
 from commands.admin import setup_cmd, cancel_cmd
-from commands.user import join_cmd, leave_cmd, status_cmd
+from commands.user import join_cmd, leave_cmd
 from events.ready import on_ready as bootstrap_on_ready
 
 log = setup_logging(level=LOG_LEVEL, json_console=False, logfile=LOG_FILE)
@@ -19,7 +19,6 @@ bot.tree.add_command(setup_cmd)
 bot.tree.add_command(cancel_cmd)
 bot.tree.add_command(join_cmd)
 bot.tree.add_command(leave_cmd)
-bot.tree.add_command(status_cmd)
 
 @bot.event
 async def on_ready_event():
