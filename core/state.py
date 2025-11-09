@@ -3,6 +3,7 @@ from typing import Dict, List, Optional
 import discord
 from utils.embeds import build_queue_embed
 from logging import getLogger
+from config import COOLDOWN_JOIN_SEC, COOLDOWN_LEAVE_SEC
 
 log = getLogger("bot")
 
@@ -10,12 +11,17 @@ log = getLogger("bot")
 STATE: Dict[int, Dict[str, object]] = {}
 GLOBAL_Q_MEMBERS: Dict[int, int] = {}
 LAST_ACTION: Dict[tuple[int, str], float] = {}
-COOLDOWN_JOIN_SEC = 5.0
-COOLDOWN_LEAVE_SEC = 5.0
 
 async def ensure_state(channel: discord.TextChannel):
     if channel.id not in STATE:
-        STATE[channel.id] = {"queue": [], "embed_msg_id": None, "lock": asyncio.Lock()}
+        STATE[channel.id] = {
+            "queue": [],
+            "embed_msg_id": None,
+            "lock": asyncio.Lock(),
+            "queue_thread_id": None,
+        }
+    else:
+        STATE[channel.id].setdefault("queue_thread_id", None)
 
 async def get_embed_message(channel: discord.TextChannel) -> Optional[discord.Message]:
     await ensure_state(channel)

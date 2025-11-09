@@ -1,11 +1,14 @@
-import discord, asyncio
+import asyncio
+import discord
 from discord import app_commands
 from logging import getLogger
 
 log = getLogger("bot")
 
 from core.state import ensure_state, update_embed, STATE, GLOBAL_Q_MEMBERS
+from core.threads import fetch_thread, delete_thread
 from db.mongo import persist_queue_doc
+
 
 @app_commands.command(name="setup", description="Admin: clears channel and creates a matchmaking queue embed here.")
 async def setup_cmd(interaction: discord.Interaction):
@@ -20,8 +23,17 @@ async def setup_cmd(interaction: discord.Interaction):
     ch: discord.TextChannel = interaction.channel
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    # audit: who ran what where
-    log.info(f"/setup by {interaction.user} ({getattr(interaction.user, 'id', None)}) in #{ch.name} ({ch.id}) guild {getattr(interaction.guild, 'name', None)} ({getattr(interaction.guild, 'id', None)})")
+    log.info(
+        "queue_setup",
+        extra={
+            "guild_id": getattr(interaction.guild, "id", None),
+            "guild_name": getattr(interaction.guild, "name", None),
+            "channel_id": ch.id,
+            "channel_name": ch.name,
+            "user_id": getattr(interaction.user, "id", None),
+            "user": str(interaction.user),
+        },
+    )
 
     try:
         await ch.purge(limit=None)
@@ -29,19 +41,43 @@ async def setup_cmd(interaction: discord.Interaction):
         pass
 
     await ensure_state(ch)
-    old_queue = STATE[ch.id]["queue"]  # type: ignore
-    for uid in list(old_queue):
-        if GLOBAL_Q_MEMBERS.get(uid) == ch.id:
-            GLOBAL_Q_MEMBERS.pop(uid, None)
-    STATE[ch.id]["queue"] = []
-    STATE[ch.id]["embed_msg_id"] = None
-    await update_embed(ch)
+    data = STATE[ch.id]
+    lock: asyncio.Lock = data["lock"]  # type: ignore
+    thread_id: int | None = None
+
+    async with lock:
+        old_queue = data["queue"]  # type: ignore
+        for uid in list(old_queue):
+            if GLOBAL_Q_MEMBERS.get(uid) == ch.id:
+                GLOBAL_Q_MEMBERS.pop(uid, None)
+        raw_thread_id = data.get("queue_thread_id")
+        if raw_thread_id:
+            try:
+                thread_id = int(raw_thread_id)
+            except (TypeError, ValueError):
+                thread_id = None
+            data["queue_thread_id"] = None
+        data["queue"] = []
+        data["embed_msg_id"] = None
+    try:
+        await update_embed(ch)
+    except Exception as exc:
+        log.warning("embed_update_fail", extra={"channel_id": ch.id, "err": repr(exc)})
     try:
         await persist_queue_doc(ch, STATE)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("persist_queue_fail", extra={"channel_id": ch.id, "err": repr(exc)})
 
-    await interaction.followup.send("✅ Setup complete. Queue is ready in this channel.", ephemeral=True)
+    if thread_id:
+        thread = await fetch_thread(interaction.client, thread_id)
+        if thread:
+            try:
+                await delete_thread(thread, "Queue setup reset.")
+            except Exception:
+                pass
+
+    await interaction.followup.send("Setup complete. Queue is ready in this channel.", ephemeral=True)
+
 
 @app_commands.command(name="cancel", description="Admin: cancels and clears the current queue in this channel.")
 async def cancel_cmd(interaction: discord.Interaction):
@@ -56,31 +92,55 @@ async def cancel_cmd(interaction: discord.Interaction):
     ch: discord.TextChannel = interaction.channel
     await ensure_state(ch)
 
-    # audit: who invoked
-    log.info(f"/status by {interaction.user} ({getattr(interaction.user,'id',None)}) in #{ch.name} ({ch.id}) guild {getattr(interaction.guild,'name',None)} ({getattr(interaction.guild,'id',None)})")
-
-    # audit: who invoked
-    log.info(f"/leave by {interaction.user} ({getattr(interaction.user,'id',None)}) in #{ch.name} ({ch.id}) guild {getattr(interaction.guild,'name',None)} ({getattr(interaction.guild,'id',None)})")
-
-    # audit: who invoked
-    log.info(f"/join by {interaction.user} ({getattr(interaction.user,'id',None)}) in #{ch.name} ({ch.id}) guild {getattr(interaction.guild,'name',None)} ({getattr(interaction.guild,'id',None)})")
     data = STATE[ch.id]
     lock: asyncio.Lock = data["lock"]  # type: ignore
+    thread_id: int | None = None
+    cleared = 0
 
     await interaction.response.defer(ephemeral=True)
     async with lock:
         queue = data["queue"]  # type: ignore
-        pre = len(queue)
+        cleared = len(queue)
         for uid in queue:
             if GLOBAL_Q_MEMBERS.get(uid) == ch.id:
                 GLOBAL_Q_MEMBERS.pop(uid, None)
+        raw_thread_id = data.get("queue_thread_id")
+        if raw_thread_id:
+            try:
+                thread_id = int(raw_thread_id)
+            except (TypeError, ValueError):
+                thread_id = None
+            data["queue_thread_id"] = None
         data["queue"] = []
-        await update_embed(ch)
-        # audit: how many cleared
-        log.info(f"/cancel cleared {pre} players in #{ch.name} ({ch.id}) guild {getattr(interaction.guild,'name',None)} ({getattr(interaction.guild,'id',None)})")
-        try:
-            await persist_queue_doc(ch, STATE)
-        except Exception:
-            pass
 
-    await interaction.followup.send("🛑 Queue cancelled and cleared.", ephemeral=True)
+    try:
+        await update_embed(ch)
+    except Exception as exc:
+        log.warning("embed_update_fail", extra={"channel_id": ch.id, "err": repr(exc)})
+    try:
+        await persist_queue_doc(ch, STATE)
+    except Exception as exc:
+        log.warning("persist_queue_fail", extra={"channel_id": ch.id, "err": repr(exc)})
+
+    log.info(
+        "queue_cancel",
+        extra={
+            "guild_id": getattr(interaction.guild, "id", None),
+            "guild_name": getattr(interaction.guild, "name", None),
+            "channel_id": ch.id,
+            "channel_name": ch.name,
+            "user_id": getattr(interaction.user, "id", None),
+            "user": str(interaction.user),
+            "cleared": cleared,
+        },
+    )
+
+    await interaction.followup.send("Queue cancelled and cleared.", ephemeral=True)
+
+    if thread_id:
+        thread = await fetch_thread(interaction.client, thread_id)
+        if thread:
+            try:
+                await delete_thread(thread, "Queue cancelled by admin.")
+            except Exception:
+                pass

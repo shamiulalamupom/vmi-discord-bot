@@ -28,7 +28,11 @@ async def init_mongo():
     matches_col = db["matches"]
     # indexes
     await queues_col.create_index([("updatedAt", -1)], name="updatedAt_desc")
-    await matches_col.create_index([("createdAt", 1)], name="ttl_createdAt", expireAfterSeconds=MATCH_TTL_DAYS*24*3600)
+    await matches_col.create_index(
+        [("createdAt", 1)],
+        name="ttl_createdAt",
+        expireAfterSeconds=MATCH_TTL_DAYS * 24 * 3600,
+    )
     await matches_col.create_index([("guildId", 1), ("createdAt", -1)], name="guild_createdAt")
     await matches_col.create_index([("threadId", 1)], name="threadId")
 
@@ -37,8 +41,14 @@ async def load_queues_from_db(STATE, GLOBAL_Q_MEMBERS):
         ch_id = int(doc.get("_id", doc.get("channelId")))
         q = [int(u) for u in doc.get("queue", [])]
         embed_id = doc.get("embedMsgId")
+        thread_id = doc.get("queueThreadId")
         import asyncio
-        STATE[ch_id] = {"queue": q, "embed_msg_id": embed_id, "lock": asyncio.Lock()}
+        STATE[ch_id] = {
+            "queue": q,
+            "embed_msg_id": embed_id,
+            "lock": asyncio.Lock(),
+            "queue_thread_id": int(thread_id) if thread_id else None,
+        }
         for uid in q:
             GLOBAL_Q_MEMBERS[uid] = ch_id
 
@@ -46,10 +56,20 @@ async def persist_queue_doc(channel, STATE):
     data = STATE[channel.id]
     queue = data["queue"]
     embed_id = data["embed_msg_id"]
+    queue_thread_id = data.get("queue_thread_id")
     await queues_col.update_one(
         {"_id": channel.id},
-        {"$set": {"_id": channel.id, "channelId": channel.id, "guildId": channel.guild.id,
-                    "queue": queue, "embedMsgId": embed_id, "updatedAt": dt.datetime.utcnow()}},
+        {
+            "$set": {
+                "_id": channel.id,
+                "channelId": channel.id,
+                "guildId": channel.guild.id,
+                "queue": queue,
+                "embedMsgId": embed_id,
+                "queueThreadId": queue_thread_id,
+                "updatedAt": dt.datetime.now(dt.timezone.utc),
+            }
+        },
         upsert=True,
     )
 
@@ -57,13 +77,19 @@ async def remove_queue_doc(channel_id: int):
     await queues_col.delete_one({"_id": channel_id})
 
 async def record_match(guild_id: int, channel_id: int, player_ids: List[int], thread_id: Optional[int]):
-    await matches_col.insert_one({
-        "guildId": guild_id,
-        "channelId": channel_id,
-        "players": player_ids,
-        "threadId": thread_id,
-        "createdAt": dt.datetime.now(),
-    })
+    await matches_col.insert_one(
+        {
+            "guildId": guild_id,
+            "channelId": channel_id,
+            "players": player_ids,
+            "threadId": thread_id,
+            "createdAt": dt.datetime.now(dt.timezone.utc),
+        }
+    )
 
 async def mark_thread_deleted(thread_id: int):
-    await matches_col.update_one({"threadId": thread_id}, {"$set": {"deletedAt": dt.datetime.now()}}, upsert=False)
+    await matches_col.update_one(
+        {"threadId": thread_id},
+        {"$set": {"deletedAt": dt.datetime.now(dt.timezone.utc)}},
+        upsert=False,
+    )

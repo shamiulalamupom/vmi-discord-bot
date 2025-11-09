@@ -1,90 +1,56 @@
-import asyncio, discord
-from typing import Optional, List
+import asyncio
+from typing import Optional, Sequence
+
+import discord
 from logging import getLogger
+
 from config import MATCH_DELETE_AFTER_SEC, MATCH_WARN_BEFORE_SEC
-from db.mongo import record_match, mark_thread_deleted
+from db.mongo import mark_thread_deleted
 
 log = getLogger("bot")
 
 THREAD_TASKS: dict[int, asyncio.Task] = {}
 
-async def schedule_thread_cleanup(bot: discord.Client, thread: discord.Thread):
-    delete_after = max(0, MATCH_DELETE_AFTER_SEC)
-    warn_before  = max(0, MATCH_WARN_BEFORE_SEC)
-    warn_delay   = max(delete_after - warn_before, 0)
-    thread_id = thread.id
-    parent_channel = thread.parent if isinstance(thread, discord.Thread) else None
 
-    async def _get_thread() -> Optional[discord.Thread]:
-        t = bot.get_channel(thread_id)
-        if isinstance(t, discord.Thread):
-            return t
+async def fetch_thread(bot: discord.Client, thread_id: int) -> Optional[discord.Thread]:
+    """Fetch a thread by id, trying cache first."""
+    cached = bot.get_channel(thread_id)
+    if isinstance(cached, discord.Thread):
+        return cached
+    try:
+        fetched = await bot.fetch_channel(thread_id)  # type: ignore[arg-type]
+        return fetched if isinstance(fetched, discord.Thread) else None
+    except discord.NotFound:
+        return None
+    except Exception as exc:
+        log.warning("thread_fetch_fail", extra={"thread_id": thread_id, "err": repr(exc)})
+        return None
+
+
+async def _unarchive_thread(thread: discord.Thread, reason: str):
+    if thread.archived:
         try:
-            t = await bot.fetch_channel(thread_id)  # type: ignore
-            return t if isinstance(t, discord.Thread) else None
-        except Exception as e:
-            log.warning("cleanup_fetch_fail", extra={"thread_id": thread_id, "err": repr(e)})
-            return None
+            await thread.edit(archived=False, reason=reason)
+        except Exception as exc:
+            log.warning("thread_unarchive_fail", extra={"thread_id": thread.id, "err": repr(exc)})
 
-    async def _unarchive(t: discord.Thread):
-        if t.archived:
-            try:
-                await t.edit(archived=False, reason="Auto-cleanup")
-            except Exception as e:
-                log.warning("cleanup_unarchive_fail", extra={"thread_id": t.id, "err": repr(e)})
 
-    try:
-        if warn_delay > 0:
-            await asyncio.sleep(warn_delay)
-        t = await _get_thread()
-        if t:
-            await _unarchive(t)
-            minutes = max(int(round(warn_before/60)), 1) if warn_before else 0
-            if minutes:
-                try:
-                    await t.send(f"⏰ This match thread will be deleted in **{minutes} minute(s)**. Please wrap up.")
-                    log.info("thread_warn_sent", extra={"thread_id": t.id, "warn_sec": warn_before})
-                except discord.Forbidden:
-                    if parent_channel:
-                        try:
-                            await parent_channel.send(f"⏰ {t.mention} will be deleted in **{minutes} minute(s)**.")
-                        except Exception: pass
-        if warn_before > 0:
-            await asyncio.sleep(warn_before)
-        t = await _get_thread()
-        if t:
-            await _unarchive(t)
-            try:
-                try:
-                    await t.send("🗑️ Deleting this thread now.")
-                except Exception: pass
-                await t.delete(reason="Auto-cleanup after match.")
-                log.info("thread_deleted", extra={"thread_id": t.id})
-            except discord.Forbidden as e:
-                log.warning("thread_delete_forbidden", extra={"thread_id": t.id, "err": repr(e)})
-            except Exception as e:
-                log.warning("thread_delete_error", extra={"thread_id": t.id, "err": repr(e)})
-            try:
-                await mark_thread_deleted(thread_id)
-            except Exception as e:
-                log.warning("mark_thread_deleted_fail", extra={"thread_id": thread_id, "err": repr(e)})
-    finally:
-        THREAD_TASKS.pop(thread_id, None)
+async def create_queue_thread(channel: discord.TextChannel) -> Optional[discord.Thread]:
+    """Create a queue coordination thread in the provided channel."""
+    me = channel.guild.me  # type: ignore[attr-defined]
+    if not me:
+        log.warning("thread_create_no_member", extra={"channel_id": channel.id})
+        return None
 
-async def create_match_thread(bot: discord.Client, channel: discord.TextChannel, user_ids: List[int]) -> Optional[discord.Thread]:
-    creating = None
-    try:
-        creating = await channel.send("Creating match thread…")
-    except discord.Forbidden:
-        creating = None
-
-    name = f"match-{discord.utils.utcnow().strftime('%H%M%S')}"
-    thread: Optional[discord.Thread] = None
-
-    me = channel.guild.me  # type: ignore
     perms = channel.permissions_for(me)
     has_private = getattr(perms, "create_private_threads", False)
-    has_public  = getattr(perms, "create_public_threads", False)
+    has_public = getattr(perms, "create_public_threads", False)
+    if not has_private and not has_public:
+        log.warning("thread_create_missing_perms", extra={"channel_id": channel.id})
+        return None
+
+    name = f"queue-{discord.utils.utcnow().strftime('%H%M%S')}"
+    thread: Optional[discord.Thread] = None
 
     try:
         if has_private:
@@ -93,75 +59,199 @@ async def create_match_thread(bot: discord.Client, channel: discord.TextChannel,
                 auto_archive_duration=1440,
                 type=discord.ChannelType.private_thread,
                 invitable=False,
-                reason="Matchmaking full (private)",
+                reason="Matchmaking queue started",
             )
-        elif has_public:
+        else:
             thread = await channel.create_thread(
                 name=name,
                 auto_archive_duration=1440,
                 type=discord.ChannelType.public_thread,
-                reason="Matchmaking full (public)",
+                reason="Matchmaking queue started",
             )
-        else:
-            if creating:
-                await creating.edit(content="❌ I lack **Create Public/Private Threads** in this channel.")
-            else:
-                await channel.send("❌ I lack **Create Public/Private Threads** in this channel.")
-            return None
-    except discord.Forbidden as e:
-        if has_public:
+    except discord.Forbidden as exc:
+        if has_private and has_public:
             try:
                 thread = await channel.create_thread(
                     name=name,
                     auto_archive_duration=1440,
                     type=discord.ChannelType.public_thread,
-                    reason="Matchmaking full (fallback)",
+                    reason="Matchmaking queue fallback",
                 )
-            except Exception as e2:
-                log.warning("thread_create_forbidden", extra={"channel_id": channel.id, "err": repr(e2)})
-                thread = None
+            except Exception as fallback_exc:
+                log.warning(
+                    "thread_create_forbidden",
+                    extra={"channel_id": channel.id, "err": repr(fallback_exc)},
+                )
+                return None
         else:
-            log.warning("thread_create_forbidden", extra={"channel_id": channel.id, "err": repr(e)})
-            thread = None
-    except Exception as e:
-        log.warning("thread_create_error", extra={"channel_id": channel.id, "err": repr(e)})
-        thread = None
+            log.warning("thread_create_forbidden", extra={"channel_id": channel.id, "err": repr(exc)})
+            return None
+    except Exception as exc:
+        log.warning("thread_create_error", extra={"channel_id": channel.id, "err": repr(exc)})
+        return None
 
-    if thread is not None:
-        if thread.type is discord.ChannelType.private_thread:
-            for uid in user_ids:
-                m = channel.guild.get_member(uid)
-                if not m:
-                    continue
-                try:
-                    await thread.add_user(m)
-                except Exception as add_err:
-                    log.warning("thread_add_user_fail", extra={"thread_id": thread.id, "user_id": uid, "err": repr(add_err)})
+    if thread:
         try:
-            mentions = " ".join(f"<@{uid}>" for uid in user_ids)
-            await thread.send(f"✅ **Queue full – match ready!**\nPlayers: {mentions}\nGood luck & have fun!")
-            if creating:
-                await creating.edit(content=f"Match thread created: {thread.mention}")
-        except Exception as post_err:
-            log.warning("thread_announce_fail", extra={"thread_id": thread.id, "err": repr(post_err)})
-        try:
-            await record_match(channel.guild.id, channel.id, user_ids, thread.id)
-        except Exception as rec_err:
-            log.warning("record_match_fail", extra={"thread_id": thread.id, "err": repr(rec_err)})
-        try:
-            task = asyncio.create_task(schedule_thread_cleanup(bot, thread))
-            THREAD_TASKS[thread.id] = task
-        except Exception as sched_err:
-            log.warning("thread_schedule_fail", extra={"thread_id": thread.id, "err": repr(sched_err)})
-    else:
-        mentions = " ".join(f"<@{uid}>" for uid in user_ids)
-        try:
-            await channel.send(f"✅ **Queue is full!** (thread creation failed)\nPlayers: {mentions}")
-            if creating:
-                await creating.delete()
-        except Exception: pass
-        try:
-            await record_match(channel.guild.id, channel.id, user_ids, None)
-        except Exception: pass
+            await thread.send("Queue thread ready. I'll ping everyone once the lobby is full.")
+        except Exception as exc:
+            log.debug("thread_intro_fail", extra={"thread_id": thread.id, "err": repr(exc)})
 
     return thread
+
+
+async def ensure_queue_thread(
+    bot: discord.Client,
+    channel: discord.TextChannel,
+    state: dict,
+) -> tuple[Optional[discord.Thread], bool]:
+    """Ensure we have an active queue thread for this channel."""
+    created = False
+    thread: Optional[discord.Thread] = None
+    raw_thread_id = state.get("queue_thread_id")
+    thread_id: Optional[int] = None
+    if isinstance(raw_thread_id, int):
+        thread_id = raw_thread_id
+    elif isinstance(raw_thread_id, str):
+        try:
+            thread_id = int(raw_thread_id)
+        except (TypeError, ValueError):
+            thread_id = None
+    if thread_id:
+        thread = await fetch_thread(bot, thread_id)
+        if thread is None:
+            state["queue_thread_id"] = None
+    if thread is None:
+        thread = await create_queue_thread(channel)
+        if thread:
+            state["queue_thread_id"] = thread.id
+            created = True
+    return thread, created
+
+
+def cancel_thread_cleanup(thread_id: int):
+    task = THREAD_TASKS.pop(thread_id, None)
+    if task:
+        task.cancel()
+
+
+async def delete_thread(thread: discord.Thread, reason: str):
+    cancel_thread_cleanup(thread.id)
+    try:
+        await _unarchive_thread(thread, reason)
+        await thread.delete(reason=reason)
+        log.info("thread_deleted_manual", extra={"thread_id": thread.id, "reason": reason})
+    except (discord.NotFound, AttributeError):
+        return
+    except discord.Forbidden as exc:
+        log.warning("thread_delete_forbidden", extra={"thread_id": thread.id, "err": repr(exc)})
+    except Exception as exc:
+        log.warning("thread_delete_error", extra={"thread_id": thread.id, "err": repr(exc)})
+
+
+async def schedule_thread_cleanup(
+    bot: discord.Client,
+    thread: discord.Thread,
+    delete_after: Optional[int] = None,
+    warn_before: Optional[int] = None,
+):
+    delete_after = max(0, delete_after if delete_after is not None else MATCH_DELETE_AFTER_SEC)
+    warn_before = max(0, warn_before if warn_before is not None else MATCH_WARN_BEFORE_SEC)
+    warn_before = min(warn_before, delete_after)
+    warn_delay = max(delete_after - warn_before, 0)
+    thread_id = thread.id
+    parent_channel = thread.parent if isinstance(thread, discord.Thread) else None
+
+    async def _runner():
+        try:
+            if warn_delay > 0:
+                await asyncio.sleep(warn_delay)
+            target = await fetch_thread(bot, thread_id)
+            if target and warn_before:
+                await _unarchive_thread(target, "Thread cleanup warning")
+                minutes = max(int(round(warn_before / 60)), 1)
+                msg = f"[!] This thread will be deleted in {minutes} minute(s). Please wrap up."
+                try:
+                    await target.send(msg)
+                except discord.Forbidden:
+                    if parent_channel:
+                        try:
+                            await parent_channel.send(f"{target.mention}: {msg}")
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    log.debug("thread_warn_fail", extra={"thread_id": target.id, "err": repr(exc)})
+
+            if warn_before > 0:
+                await asyncio.sleep(warn_before)
+            elif delete_after > 0 and warn_delay == 0:
+                await asyncio.sleep(delete_after)
+
+            target = await fetch_thread(bot, thread_id)
+            if target:
+                await _unarchive_thread(target, "Thread cleanup")
+                try:
+                    await target.send("Thread is being deleted automatically.")
+                except Exception:
+                    pass
+                try:
+                    await target.delete(reason="Auto-cleanup after match.")
+                    log.info("thread_deleted_auto", extra={"thread_id": target.id})
+                except discord.Forbidden as exc:
+                    log.warning("thread_delete_forbidden", extra={"thread_id": target.id, "err": repr(exc)})
+                except Exception as exc:
+                    log.warning("thread_delete_error", extra={"thread_id": target.id, "err": repr(exc)})
+                try:
+                    await mark_thread_deleted(thread_id)
+                except Exception as exc:
+                    log.warning("mark_thread_deleted_fail", extra={"thread_id": thread_id, "err": repr(exc)})
+        finally:
+            THREAD_TASKS.pop(thread_id, None)
+
+    cancel_thread_cleanup(thread_id)
+    THREAD_TASKS[thread_id] = asyncio.create_task(_runner())
+
+
+async def add_members_to_thread(
+    thread: discord.Thread,
+    guild: discord.Guild,
+    user_ids: Sequence[int],
+):
+    if thread.type is not discord.ChannelType.private_thread:
+        return
+    for uid in user_ids:
+        member = guild.get_member(uid)
+        if not member:
+            continue
+        try:
+            await thread.add_user(member)
+        except discord.Forbidden as exc:
+            log.debug("thread_add_user_forbidden", extra={"thread_id": thread.id, "user_id": uid, "err": repr(exc)})
+        except discord.HTTPException as exc:
+            if getattr(exc, "code", None) == 50013:  # Missing permissions
+                log.debug("thread_add_user_http_forbidden", extra={"thread_id": thread.id, "user_id": uid})
+            else:
+                log.debug("thread_add_user_http", extra={"thread_id": thread.id, "user_id": uid, "err": repr(exc)})
+        except Exception as exc:
+            log.debug("thread_add_user_fail", extra={"thread_id": thread.id, "user_id": uid, "err": repr(exc)})
+
+
+async def remove_members_from_thread(
+    thread: discord.Thread,
+    guild: discord.Guild,
+    user_ids: Sequence[int],
+):
+    if thread.type is not discord.ChannelType.private_thread:
+        return
+    for uid in user_ids:
+        member = guild.get_member(uid)
+        if not member:
+            continue
+        try:
+            await thread.remove_user(member)
+        except discord.Forbidden as exc:
+            log.debug(
+                "thread_remove_user_forbidden",
+                extra={"thread_id": thread.id, "user_id": uid, "err": repr(exc)},
+            )
+        except Exception as exc:
+            log.debug("thread_remove_user_fail", extra={"thread_id": thread.id, "user_id": uid, "err": repr(exc)})
